@@ -5,9 +5,13 @@ Usage examples:
         --harms privacy,misinformation --description "..."
     ailog update <id> --status triaged --note "assigned to safety team"
     ailog list --min-severity high
+    ailog link <id> <other-id> --note "same root cause"
+    ailog note <id> --note "waiting on vendor patch"
+    ailog aging --stale-days 7
     ailog dedup
     ailog trends --bucket month
     ailog export incidents-backup.json
+    ailog export incidents.csv --format csv
 
 The database defaults to ``~/.ai-incident-logger/incidents.jsonl``; override
 with ``--db PATH`` or the ``AI_INCIDENT_DB`` environment variable.
@@ -21,8 +25,9 @@ import os
 import sys
 
 from . import __version__
+from .aging import format_aging, stale_incidents
 from .dedup import duplicate_clusters, find_duplicates
-from .exporter import export_json
+from .exporter import export_csv, export_json
 from .models import HarmCategory, Incident, Severity, Status
 from .store import IncidentNotFoundError, AmbiguousIdError, IncidentStore
 from .trends import format_report, summarize, timeseries
@@ -64,8 +69,10 @@ def _detail(incident: Incident) -> str:
     ]
     for event in incident.history:
         frm = event.get("from") or "(new)"
-        note = f" — {event['note']}" if event.get("note") else ""
+        note = f" -- {event['note']}" if event.get("note") else ""
         lines.append(f"  {event['at']}  {frm} -> {event['to']}{note}")
+    if incident.related_ids:
+        lines.append(f"related     : {', '.join(incident.related_ids)}")
     return "\n".join(lines)
 
 
@@ -209,8 +216,60 @@ def cmd_trends(args: argparse.Namespace) -> int:
 def cmd_export(args: argparse.Namespace) -> int:
     store = IncidentStore(resolve_db(args))
     incidents = store.query(**_query_kwargs(args))
-    export_json(incidents, args.path)
+    if args.format == "csv":
+        export_csv(incidents, args.path)
+    else:
+        export_json(incidents, args.path)
     print(f"exported {len(incidents)} incident(s) to {args.path}")
+    return 0
+
+
+def cmd_link(args: argparse.Namespace) -> int:
+    store = IncidentStore(resolve_db(args))
+    try:
+        if args.remove:
+            store.unlink_incidents(args.id, args.other)
+            print(f"unlinked {args.id} from {args.other}")
+        else:
+            store.link_incidents(args.id, args.other, note=args.note or "")
+            print(f"linked {args.id} <-> {args.other}")
+    except (IncidentNotFoundError, AmbiguousIdError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_note(args: argparse.Namespace) -> int:
+    store = IncidentStore(resolve_db(args))
+    try:
+        store.add_note(args.id, args.note)
+    except (IncidentNotFoundError, AmbiguousIdError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"added note to incident {args.id}")
+    return 0
+
+
+def cmd_aging(args: argparse.Namespace) -> int:
+    store = IncidentStore(resolve_db(args))
+    incidents = store.all()
+    if args.json:
+        rows = [
+            {
+                "id": row["incident"].id,
+                "title": row["incident"].title,
+                "severity": row["incident"].severity,
+                "status": row["incident"].status,
+                "age_days": row["age_days"],
+                "stuck_days": row["stuck_days"],
+            }
+            for row in stale_incidents(
+                incidents, stale_days=args.stale_days, now=args.now
+            )
+        ]
+        print(json.dumps(rows, indent=2))
+    else:
+        print(format_aging(incidents, stale_days=args.stale_days, now=args.now))
     return 0
 
 
@@ -286,10 +345,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_trends)
 
-    p = sub.add_parser("export", help="export incidents to JSON")
+    p = sub.add_parser("export", help="export incidents to JSON or CSV")
     p.add_argument("path")
+    p.add_argument("--format", choices=["json", "csv"], default="json",
+                   help="export format (default: json)")
     _add_query_flags(p)
     p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("link", help="link two incidents as related")
+    p.add_argument("id", help="incident id (unambiguous prefix accepted)")
+    p.add_argument("other", help="id of the incident to link to")
+    p.add_argument("--note", default="", help="note recorded in both histories")
+    p.add_argument("--remove", action="store_true",
+                   help="remove the link instead of adding it")
+    p.set_defaults(func=cmd_link)
+
+    p = sub.add_parser("note", help="append a note without changing status")
+    p.add_argument("id", help="incident id (unambiguous prefix accepted)")
+    p.add_argument("--note", required=True, help="note recorded in history")
+    p.set_defaults(func=cmd_note)
+
+    p = sub.add_parser("aging", help="show open incidents stuck in their status")
+    p.add_argument("--stale-days", type=float, default=7.0,
+                   help="days in current status before an incident counts as stale")
+    p.add_argument("--now", default=None,
+                   help="pin 'now' to an ISO-8601 timestamp (reproducible reports)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_aging)
 
     return parser
 

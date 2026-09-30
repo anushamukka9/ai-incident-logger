@@ -4,11 +4,15 @@ An incident moves through a strict status lifecycle:
 
     reported -> triaged -> mitigated -> resolved
 
-with two escape hatches: a triaged incident can be sent back to ``reported``
-for more information, a mitigated incident can regress to ``triaged``, and a
-resolved incident can be *reopened* (back to ``triaged``) when the fix turns
-out to be incomplete. Every transition is appended to the incident's history
-so the record keeps a tamper-evident audit trail.
+with three escape hatches: a triaged incident can be sent back to
+``reported`` for more information, a mitigated incident can regress to
+``triaged``, and a resolved incident can be *reopened* (back to
+``triaged``) when the fix turns out to be incomplete. Every transition is
+appended to the incident's history so the record keeps a full audit trail.
+
+Incidents can also be linked to each other (``related_ids``) when the same
+underlying failure is reported twice; linking is recorded in the history
+like any other change.
 """
 
 from __future__ import annotations
@@ -114,6 +118,7 @@ class Incident:
     status: str                      # one of Status.ALL
     reporter: str = ""
     refs: list = field(default_factory=list)      # external links / ticket ids
+    related_ids: list = field(default_factory=list)  # linked incident ids
     created_at: str = ""
     updated_at: str = ""
     history: list = field(default_factory=list)   # [{from,to,at,note}]
@@ -123,6 +128,9 @@ class Incident:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Incident":
+        data = dict(data)
+        # Records written before linking existed have no related_ids.
+        data.setdefault("related_ids", [])
         return cls(**data)
 
     def transition(self, to_status: str, note: str = "") -> "Incident":

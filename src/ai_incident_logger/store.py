@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 
-from .models import Incident, InvalidTransitionError
+from .models import Incident, IncidentError, InvalidTransitionError
 
 
 class IncidentNotFoundError(Exception):
@@ -106,6 +106,59 @@ class IncidentStore:
         incident.updated_at = _now()
         self._save()
         return incident
+
+    # -- linking and notes ---------------------------------------------------
+    def _record_note(self, incident: Incident, note: str) -> None:
+        from .models import _now
+
+        incident.history.append({
+            "from": incident.status,
+            "to": incident.status,
+            "at": _now(),
+            "note": note,
+        })
+        incident.updated_at = _now()
+
+    def add_note(self, id_or_prefix: str, note: str) -> Incident:
+        """Append a note to an incident's history without changing status."""
+        incident = self.get(id_or_prefix)
+        self._record_note(incident, note)
+        self._save()
+        return incident
+
+    def link_incidents(
+        self, id_or_prefix: str, other_id_or_prefix: str, note: str = ""
+    ) -> tuple[Incident, Incident]:
+        """Mark two incidents as related (e.g. confirmed duplicates).
+
+        Linking is symmetric and recorded in both incidents' histories.
+        """
+        first = self.get(id_or_prefix)
+        second = self.get(other_id_or_prefix)
+        if first.id == second.id:
+            raise IncidentError("cannot link an incident to itself")
+        for incident, other in ((first, second), (second, first)):
+            if other.id not in incident.related_ids:
+                incident.related_ids.append(other.id)
+            label = f"linked to {other.id}"
+            if note:
+                label += f": {note}"
+            self._record_note(incident, label)
+        self._save()
+        return first, second
+
+    def unlink_incidents(
+        self, id_or_prefix: str, other_id_or_prefix: str
+    ) -> tuple[Incident, Incident]:
+        """Remove a link previously created with :meth:`link_incidents`."""
+        first = self.get(id_or_prefix)
+        second = self.get(other_id_or_prefix)
+        for incident, other in ((first, second), (second, first)):
+            if other.id in incident.related_ids:
+                incident.related_ids.remove(other.id)
+            self._record_note(incident, f"unlinked from {other.id}")
+        self._save()
+        return first, second
 
     # -- querying ------------------------------------------------------------
     def query(

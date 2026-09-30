@@ -3,17 +3,25 @@
 Exports are full-fidelity snapshots (every field, including the status-change
 history) wrapped in a small envelope with export metadata, so a JSON file is a
 complete backup that :func:`load_json` can read back into ``Incident``
-objects.
+objects. :func:`export_csv` writes a flat one-row-per-incident CSV for
+spreadsheets and dashboards; it drops the history detail.
 """
 
 from __future__ import annotations
 
+import csv
 import json
 from datetime import datetime, timezone
 
 from .models import Incident
 
 EXPORT_FORMAT = "ai-incident-logger/1"
+
+CSV_COLUMNS = (
+    "id", "title", "description", "system", "severity", "status",
+    "harm_categories", "reporter", "refs", "related_ids",
+    "created_at", "updated_at",
+)
 
 
 def export_json(incidents: list[Incident], path: str, indent: int = 2) -> str:
@@ -54,3 +62,30 @@ def export_json_string(incidents: list[Incident]) -> str:
         "incidents": [i.to_dict() for i in incidents],
     }
     return json.dumps(doc, ensure_ascii=False)
+
+
+def export_csv(incidents: list[Incident], path: str) -> str:
+    """Write incidents to ``path`` as a flat CSV (one row per incident).
+
+    List fields are joined with ";". The status-change history is not
+    included; use :func:`export_json` for the full record.
+    """
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        for incident in incidents:
+            writer.writerow({
+                "id": incident.id,
+                "title": incident.title,
+                "description": incident.description,
+                "system": incident.system,
+                "severity": incident.severity,
+                "status": incident.status,
+                "harm_categories": ";".join(incident.harm_categories),
+                "reporter": incident.reporter,
+                "refs": ";".join(incident.refs),
+                "related_ids": ";".join(incident.related_ids),
+                "created_at": incident.created_at,
+                "updated_at": incident.updated_at,
+            })
+    return path
