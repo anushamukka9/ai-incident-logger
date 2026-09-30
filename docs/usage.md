@@ -17,8 +17,9 @@ data. For a 2-minute tour, see `examples/quickstart.py`.
 | `harm_categories` | no | Any of: `privacy`, `bias_discrimination`, `physical_safety`, `misinformation`, `security`, `robustness`, `transparency`, `autonomy`, `other` |
 | `reporter` | no | Who filed it |
 | `refs` | no | Ticket ids, URLs, paper links |
-| `status` | — | Managed through the lifecycle below |
-| `history` | — | Append-only log of every status change |
+| `status` | managed | Managed through the lifecycle below |
+| `history` | append-only | Append-only log of every status change |
+| `related_ids` | managed | Linked incident ids (see Linking below) |
 
 **Status lifecycle.**
 
@@ -79,6 +80,23 @@ Fix a typo without touching the lifecycle:
 ailog edit 9f3c1a --severity critical --harms privacy,security
 ```
 
+Add a note without moving the status (every note lands in `history`):
+
+```bash
+ailog note 9f3c1a --note "waiting on vendor patch"
+```
+
+## Linking related incidents
+
+`ailog dedup` suggests candidates; `ailog link` records the human verdict:
+
+```bash
+ailog link 9f3c1a 7d2b9e --note "same root cause"
+```
+
+Linking is symmetric (both records list each other in `related_ids`) and
+audited in both histories. Undo it with `ailog link 9f3c1a 7d2b9e --remove`.
+
 ## Deduplication
 
 The same failure is often reported twice with different wording. `ailog dedup`
@@ -104,16 +122,33 @@ prints totals, open vs. resolved, counts by status / severity / harm category,
 and a per-bucket time series. `--bucket week` gives weekly granularity.
 Add `--json` for machine-readable output you can pipe into a dashboard.
 
+## Aging reports
+
+`ailog aging` lists open incidents that have been sitting in their current
+status longer than `--stale-days` (default 7), worst first:
+
+```bash
+ailog aging --stale-days 7
+```
+
+This catches both un-triaged reports and mitigations that were never
+verified. `--now` pins the reference time to an ISO-8601 timestamp for
+reproducible reports; `--json` emits machine-readable rows. See
+`examples/sla_review.py` for a runnable demo.
+
 ## Export
 
 ```bash
 ailog export backup.json                      # everything
 ailog export q3-critical.json --min-severity high --status resolved
+ailog export report.csv --format csv          # flat CSV for spreadsheets
 ```
 
 Exports are versioned JSON documents (`"format": "ai-incident-logger/1"`)
-containing every field including history — a complete backup. Read one back
-in Python with `ai_incident_logger.load_json`.
+containing every field including history: a complete backup. Read one back
+in Python with `ai_incident_logger.load_json`. The CSV export is a flat
+one-row-per-incident view (history detail not included) for dashboards and
+spreadsheets.
 
 ## Python API
 
@@ -148,7 +183,7 @@ export_json(store.all(), "backup.json")
 - **File first, perfect later.** A `reported` incident with a rough
   description beats a perfect report filed next week. Use `ailog edit` to
   refine.
-- **Keep `system` names stable** (`support-chatbot v3`, not `the bot`) —
+- **Keep `system` names stable** (`support-chatbot v3`, not `the bot`):
   deduplication and per-system trends both rely on it.
 - **Put the "why" in the transition note**, not just the "what":
   `--note "regression on 2.1.4; reopening"` is far more useful than
