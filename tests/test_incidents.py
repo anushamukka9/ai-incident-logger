@@ -228,3 +228,177 @@ def test_cli_file_and_list(tmp_path):
     bad = run("update", incident_id, "--status", "resolved")
     assert bad.returncode != 0  # triaged -> resolved skips mitigation
     assert "error" in bad.stderr.lower()
+
+
+def test_link_and_unlink_incidents(tmp_path):
+    from ai_incident_logger import IncidentError
+
+    store = IncidentStore(str(tmp_path / "incidents.jsonl"))
+    a = store.add(make_incident(title="PII leak in chat"))
+    b = store.add(make_incident(title="PII leak in email digest"))
+
+    store.link_incidents(a.id, b.id, note="same root cause")
+    assert store.get(a.id).related_ids == [b.id]
+    assert store.get(b.id).related_ids == [a.id]
+    assert "linked to" in store.get(a.id).history[-1]["note"]
+
+    # linking twice does not duplicate the link
+    store.link_incidents(a.id, b.id)
+    assert store.get(a.id).related_ids == [b.id]
+
+    # self-linking is rejected
+    with pytest.raises(IncidentError):
+        store.link_incidents(a.id, a.id)
+
+    store.unlink_incidents(a.id, b.id)
+    assert store.get(a.id).related_ids == []
+    assert store.get(b.id).related_ids == []
+
+
+def test_link_survives_reload(tmp_path):
+    store = IncidentStore(str(tmp_path / "incidents.jsonl"))
+    a = store.add(make_incident(title="PII leak in chat"))
+    b = store.add(make_incident(title="PII leak in email digest"))
+    store.link_incidents(a.id, b.id)
+
+    reloaded = IncidentStore(str(tmp_path / "incidents.jsonl"))
+    assert reloaded.get(a.id).related_ids == [b.id]
+
+
+def test_old_records_load_without_related_ids(tmp_path):
+    # Simulate a database written before linking existed.
+    db = tmp_path / "incidents.jsonl"
+    incident = make_incident()
+    data = incident.to_dict()
+    del data["related_ids"]
+    db.write_text(json.dumps(data) + "\n", encoding="utf-8")
+
+    store = IncidentStore(str(db))
+    assert store.get(incident.id).related_ids == []
+
+
+def test_add_note_keeps_status(tmp_path):
+    store = IncidentStore(str(tmp_path / "incidents.jsonl"))
+    incident = store.add(make_incident())
+    store.add_note(incident.id, "waiting on vendor patch")
+
+    fetched = store.get(incident.id)
+    assert fetched.status == Status.REPORTED
+    assert fetched.history[-1]["note"] == "waiting on vendor patch"
+    assert fetched.history[-1]["from"] == fetched.history[-1]["to"] == Status.REPORTED
+
+
+def test_aging_and_stale_detection():
+    from datetime import datetime, timedelta, timezone
+
+    from ai_incident_logger import (
+        age_days,
+        format_aging,
+        stale_incidents,
+        time_in_status_days,
+    )
+
+    now = datetime(2026, 9, 29, 12, 0, 0, tzinfo=timezone.utc)
+
+    def aged(days_ago, status=Status.REPORTED):
+        incident = make_incident()
+        stamp = (now - timedelta(days=days_ago)).isoformat(timespec="seconds")
+        incident.created_at = stamp
+        incident.updated_at = stamp
+        incident.status = status
+        incident.history = [{"from": "", "to": status, "at": stamp, "note": ""}]
+        return incident
+
+    fresh = aged(1)
+    stale_report = aged(20)
+    old_but_moving = aged(20)
+    old_but_moving.history.append({
+        "from": Status.REPORTED, "to": Status.TRIAGED,
+        "at": (now - timedelta(days=2)).isoformat(timespec="seconds"),
+        "note": "triaged",
+    })
+    old_but_moving.status = Status.TRIAGED
+    resolved = aged(30, status=Status.RESOLVED)
+
+    assert age_days(fresh, now=now) == pytest.approx(1.0, abs=0.01)
+    assert time_in_status_days(stale_report, now=now) == pytest.approx(20.0, abs=0.01)
+
+    stale = stale_incidents(
+        [fresh, stale_report, old_but_moving, resolved], stale_days=7, now=now
+    )
+    stale_ids = [row["incident"].id for row in stale]
+    assert stale_report.id in stale_ids
+    assert fresh.id not in stale_ids          # too young
+    assert old_but_moving.id not in stale_ids  # moved recently
+    assert resolved.id not in stale_ids        # resolved is never stale
+
+    report = format_aging([stale_report], stale_days=7, now=now)
+    assert "stale" in report
+    assert stale_report.title in report
+
+
+def test_export_csv_roundtrip(tmp_path):
+    import csv
+
+    from ai_incident_logger import export_csv
+
+    store = IncidentStore(str(tmp_path / "incidents.jsonl"))
+    a = store.add(make_incident(title="PII leak in chat"))
+    b = store.add(make_incident(title="Biased hiring scores",
+                                severity=Severity.MEDIUM))
+    store.link_incidents(a.id, b.id)
+
+    path = str(tmp_path / "incidents.csv")
+    export_csv(store.all(), path)
+    with open(path, encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == 2
+    by_id = {row["id"]: row for row in rows}
+    assert by_id[a.id]["severity"] == Severity.HIGH
+    assert by_id[a.id]["related_ids"] == b.id
+    assert by_id[b.id]["harm_categories"] == HarmCategory.PRIVACY
+
+
+def test_cli_link_note_aging_and_csv_export(tmp_path):
+    db = str(tmp_path / "cli.jsonl")
+    env = dict(os.environ, AI_INCIDENT_DB=db)
+
+    def run(*argv):
+        return subprocess.run(
+            [sys.executable, "-m", "ai_incident_logger", *argv],
+            capture_output=True, text=True, env=env, check=False,
+        )
+
+    filed_a = run("file", "--title", "PII leak in chat",
+                  "--description", "phone number in transcript",
+                  "--system", "chatbot v2", "--severity", "high")
+    assert filed_a.returncode == 0, filed_a.stderr
+    filed_b = run("file", "--title", "PII leak in digest",
+                  "--description", "address in email digest",
+                  "--system", "chatbot v2", "--severity", "medium")
+    assert filed_b.returncode == 0, filed_b.stderr
+    id_a = filed_a.stdout.split("filed incident")[1].split()[0]
+    id_b = filed_b.stdout.split("filed incident")[1].split()[0]
+
+    linked = run("link", id_a, id_b, "--note", "same root cause")
+    assert linked.returncode == 0, linked.stderr
+    assert "linked" in linked.stdout
+
+    noted = run("note", id_a, "--note", "waiting on vendor patch")
+    assert noted.returncode == 0, noted.stderr
+
+    shown = run("show", id_a)
+    assert shown.returncode == 0, shown.stderr
+    assert id_b in shown.stdout  # related id visible
+    assert "waiting on vendor patch" in shown.stdout
+
+    csv_path = str(tmp_path / "out.csv")
+    exported = run("export", csv_path, "--format", "csv")
+    assert exported.returncode == 0, exported.stderr
+    with open(csv_path, encoding="utf-8") as fh:
+        assert "PII leak in chat" in fh.read()
+
+    # pin "now" far in the future so both reports count as stale
+    aging = run("aging", "--stale-days", "7", "--now", "2030-01-01T00:00:00+00:00")
+    assert aging.returncode == 0, aging.stderr
+    assert "stale" in aging.stdout
